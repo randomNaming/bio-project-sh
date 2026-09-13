@@ -1,8 +1,11 @@
 #!/bin/bash
 # 生物信息学脚本工具箱 - 学校精简版
 # 基于 kejilion/sh v4.5.7 裁剪，仅保留：1.系统信息查询 2.系统更新 3.系统清理 00.脚本更新 0.退出
-# 原项目: https://github.com/kejilion/sh
-sh_v="4.5.7"
+# 项目仓库: https://github.com/randomNaming/bio-project-sh
+sh_v="1.0.0"
+
+# 脚本分发地址（服务器 nginx 站点根，更新检查/下载均走此地址）
+dist_base="https://bio-sh.nknpq3nl.icu"
 
 
 gl_hong='\033[31m'
@@ -12,54 +15,10 @@ gl_bai='\033[0m'
 gl_kjlan='\033[96m'
 
 
-canshu="default"
 permission_granted="false"
-ENABLE_STATS="true"
 
 
-# 收集功能埋点信息的函数，记录当前脚本版本号，使用时间，系统版本，CPU架构，机器所在国家和用户使用的功能名称，绝对不涉及任何敏感信息，请放心！请相信我！
-# 为什么要设计这个功能，目的更好的了解用户喜欢使用的功能，进一步优化功能推出更多符合用户需求的功能。
-# 全文可搜搜 send_stats 函数调用位置，透明开源，如有顾虑可拒绝使用。
-
-send_stats() {
-	if [ "$ENABLE_STATS" == "false" ]; then
-		return
-	fi
-
-	local country=$(curl -s ipinfo.io/country)
-	local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
-	local cpu_arch=$(uname -m)
-
-	(
-		curl -s -X POST "https://api.kejilion.pro/api/log" \
-			-H "Content-Type: application/json" \
-			-d "{\"action\":\"$1\",\"timestamp\":\"$(date -u '+%Y-%m-%d %H:%M:%S')\",\"country\":\"$country\",\"os_info\":\"$os_info\",\"cpu_arch\":\"$cpu_arch\",\"version\":\"$sh_v\"}" \
-		&>/dev/null
-	) &
-
-}
-
-
-yinsiyuanquan2() {
-
-if grep -q '^ENABLE_STATS="false"' /usr/local/bin/k > /dev/null 2>&1; then
-	sed -i 's/^ENABLE_STATS="true"/ENABLE_STATS="false"/' ~/kejilion.sh
-elif grep -q '^ENABLE_STATS="false"' ~/kejilion.sh.bak > /dev/null 2>&1; then
-	sed -i 's/^ENABLE_STATS="true"/ENABLE_STATS="false"/' ~/kejilion.sh
-fi
-
-}
-
-
-canshu_v6() {
-	if grep -q '^canshu="V6"' /usr/local/bin/k > /dev/null 2>&1; then
-		sed -i 's/^canshu="default"/canshu="V6"/' ~/kejilion.sh
-	elif grep -q '^canshu="V6"' ~/kejilion.sh.bak > /dev/null 2>&1; then
-		sed -i 's/^canshu="default"/canshu="V6"/' ~/kejilion.sh
-	fi
-}
-
-
+# 脚本更新后，从已安装的旧版本恢复许可同意状态
 CheckFirstRun_true() {
 	if grep -q '^permission_granted="true"' /usr/local/bin/k > /dev/null 2>&1; then
 		sed -i 's/^permission_granted="false"/permission_granted="true"/' ~/kejilion.sh
@@ -67,17 +26,6 @@ CheckFirstRun_true() {
 		sed -i 's/^permission_granted="false"/permission_granted="true"/' ~/kejilion.sh
 	fi
 }
-
-
-quanju_canshu() {
-if [ "$canshu" = "CN" ] || [ "$canshu" = "V6" ]; then
-	gh_proxy="https://gh.kejilion.pro/"
-else
-	gh_proxy="https://"
-fi
-
-}
-quanju_canshu
 
 
 install() {
@@ -336,17 +284,15 @@ UserLicenseAgreement() {
 	clear
 	echo -e "${gl_kjlan}欢迎使用生物信息学脚本工具箱${gl_bai}"
 	echo "首次使用脚本，请先阅读并同意用户许可协议。"
-	echo "用户许可协议: https://blog.kejilion.pro/user-license-agreement/"
+	echo "用户许可协议: ${dist_base}/AGREEMENT.txt"
 	echo -e "----------------------"
 	read -e -p "是否同意以上条款？(y/n): " user_input
 
 
 	if [ "$user_input" = "y" ] || [ "$user_input" = "Y" ]; then
-		send_stats "许可同意"
 		sed -i 's/^permission_granted="false"/permission_granted="true"/' ~/kejilion.sh
 		sed -i 's/^permission_granted="false"/permission_granted="true"/' /usr/local/bin/k
 	else
-		send_stats "许可拒绝"
 		clear
 		exit
 	fi
@@ -362,7 +308,6 @@ linux_info() {
 
 	clear
 	echo -e "${gl_kjlan}正在查询系统信息……${gl_bai}"
-	send_stats "系统信息查询"
 
 	ip_address
 
@@ -571,24 +516,22 @@ linux_clean() {
 # ----------------------------
 kejilion_update() {
 
-send_stats "脚本更新"
 cd ~
 while true; do
 	clear
 	echo "更新日志"
 	echo "------------------------"
-	echo "全部日志: ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion_sh_log.txt"
+	echo "全部日志: ${dist_base}/kejilion_sh_log.txt"
 	echo "------------------------"
 
-	curl -s --max-time 15 ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion_sh_log.txt | tail -n 30
-	# 只下载前5行获取版本号，避免下载整个脚本
-	local sh_v_new=$(curl -s --max-time 15 -r 0-200 ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh | grep -o 'sh_v="[0-9.]*"' | head -1 | cut -d '"' -f 2)
+	curl -s --max-time 15 "${dist_base}/kejilion_sh_log.txt" | tail -n 30
+	# 只下载文件头部获取版本号，避免下载整个脚本
+	local sh_v_new=$(curl -s --max-time 15 -r 0-200 "${dist_base}/kejilion.sh" | grep -o 'sh_v="[0-9.]*"' | head -1 | cut -d '"' -f 2)
 
 	if [ -z "$sh_v_new" ]; then
 		echo -e "${gl_hong}无法获取最新版本信息，请检查网络连接${gl_bai}"
 	elif [ "$sh_v" = "$sh_v_new" ]; then
 		echo -e "${gl_lv}你已经是最新版本！${gl_huang}v$sh_v${gl_bai}"
-		send_stats "脚本已经最新了，无需更新"
 	else
 		echo "发现新版本！"
 		echo -e "当前版本 v$sh_v        最新版本 ${gl_huang}v$sh_v_new${gl_bai}"
@@ -612,31 +555,20 @@ while true; do
 	case "$choice" in
 		1)
 			clear
-			local country=$(curl -s --max-time 5 ipinfo.io/country)
-			local download_url
-			if [ "$country" = "CN" ]; then
-				download_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/cn/kejilion.sh"
-			else
-				download_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh"
-			fi
-
 			# 备份当前脚本
 			cp -f ~/kejilion.sh ~/kejilion.sh.bak 2>/dev/null
 
 			# 下载到临时文件，校验后再替换
 			local tmp_file=$(mktemp ~/kejilion_tmp.XXXXXX)
-			if curl -sS --max-time 60 --fail -o "$tmp_file" "$download_url" && \
+			if curl -sS --max-time 60 --fail -o "$tmp_file" "${dist_base}/kejilion.sh" && \
 			   [ -s "$tmp_file" ] && \
 			   head -1 "$tmp_file" | grep -q '^#!/bin/bash'; then
 				chmod +x "$tmp_file"
 				mv -f "$tmp_file" ~/kejilion.sh
-				canshu_v6
 				CheckFirstRun_true
-				yinsiyuanquan2
 				cp -f ~/kejilion.sh /usr/local/bin/k > /dev/null 2>&1
 				ln -sf /usr/local/bin/k /usr/bin/k > /dev/null 2>&1
 				echo -e "${gl_lv}脚本已更新到最新版本！${gl_huang}v$sh_v_new${gl_bai}"
-				send_stats "脚本已经最新$sh_v_new"
 			else
 				rm -f "$tmp_file"
 				# 恢复备份
@@ -644,7 +576,6 @@ while true; do
 					mv -f ~/kejilion.sh.bak ~/kejilion.sh
 				fi
 				echo -e "${gl_hong}更新失败！下载出错或文件校验不通过，已恢复原版本${gl_bai}"
-				send_stats "脚本更新失败"
 			fi
 			break_end
 			~/kejilion.sh
@@ -652,28 +583,10 @@ while true; do
 			;;
 		2)
 			clear
-			local country=$(curl -s --max-time 5 ipinfo.io/country)
-			local ipv6_address=$(curl -s --max-time 1 ipv6.ip.sb)
-			local cron_proxy cron_sed_cmd
-			if [ "$country" = "CN" ]; then
-				cron_proxy="https://gh.kejilion.pro/"
-				cron_sed_cmd="sed -i 's/canshu=\"default\"/canshu=\"CN\"/g' ~/kejilion.sh"
-			elif [ -n "$ipv6_address" ]; then
-				cron_proxy="https://gh.kejilion.pro/"
-				cron_sed_cmd="sed -i 's/canshu=\"default\"/canshu=\"V6\"/g' ~/kejilion.sh"
-			else
-				cron_proxy="https://"
-				cron_sed_cmd=""
-			fi
-
-			# 构建健壮的自动更新命令：下载到临时文件 → 校验 → 备份 → 替换 → 恢复本地设置 → 部署
-			SH_Update_task="cd ~ && tmp=\$(mktemp ~/kejilion_tmp.XXXXXX) && curl -sS --max-time 60 --fail -o \"\$tmp\" ${cron_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh && [ -s \"\$tmp\" ] && head -1 \"\$tmp\" | grep -q '^#!/bin/bash' && cp -f ~/kejilion.sh ~/kejilion.sh.bak 2>/dev/null && chmod +x \"\$tmp\" && mv -f \"\$tmp\" ~/kejilion.sh"
-			# 追加设置恢复
-			if [ -n "$cron_sed_cmd" ]; then
-				SH_Update_task="$SH_Update_task && $cron_sed_cmd"
-			fi
-			# 从旧脚本恢复 permission_granted 和 ENABLE_STATS 设置
-			SH_Update_task="$SH_Update_task && grep -q 'permission_granted=\"true\"' ~/kejilion.sh.bak 2>/dev/null && sed -i 's/permission_granted=\"false\"/permission_granted=\"true\"/' ~/kejilion.sh; grep -q 'ENABLE_STATS=\"false\"' ~/kejilion.sh.bak 2>/dev/null && sed -i 's/ENABLE_STATS=\"true\"/ENABLE_STATS=\"false\"/' ~/kejilion.sh"
+			# 自动更新任务：下载到临时文件 → 校验 → 备份 → 替换 → 恢复许可状态 → 部署 k 命令
+			SH_Update_task="cd ~ && tmp=\$(mktemp ~/kejilion_tmp.XXXXXX) && curl -sS --max-time 60 --fail -o \"\$tmp\" ${dist_base}/kejilion.sh && [ -s \"\$tmp\" ] && head -1 \"\$tmp\" | grep -q '^#!/bin/bash' && cp -f ~/kejilion.sh ~/kejilion.sh.bak 2>/dev/null && chmod +x \"\$tmp\" && mv -f \"\$tmp\" ~/kejilion.sh"
+			# 从旧脚本恢复许可同意状态
+			SH_Update_task="$SH_Update_task && grep -q 'permission_granted=\"true\"' ~/kejilion.sh.bak 2>/dev/null && sed -i 's/permission_granted=\"false\"/permission_granted=\"true\"/' ~/kejilion.sh"
 			# 部署到 /usr/local/bin/k 和 /usr/bin/k
 			SH_Update_task="$SH_Update_task; cp -f ~/kejilion.sh /usr/local/bin/k 2>/dev/null; ln -sf /usr/local/bin/k /usr/bin/k 2>/dev/null"
 			# 下载失败时清理临时文件
@@ -683,14 +596,12 @@ while true; do
 			(crontab -l | grep -v "kejilion.sh") | crontab -
 			(crontab -l 2>/dev/null; echo "$(shuf -i 0-59 -n 1) 2 * * * bash -c '$SH_Update_task'") | crontab -
 			echo -e "${gl_lv}自动更新已开启，每天凌晨2点脚本会自动更新！${gl_bai}"
-			send_stats "开启脚本自动更新"
 			break_end
 			;;
 		3)
 			clear
 			(crontab -l | grep -v "kejilion.sh") | crontab -
 			echo -e "${gl_lv}自动更新已关闭${gl_bai}"
-			send_stats "关闭脚本自动更新"
 			break_end
 			;;
 		*)
@@ -726,8 +637,8 @@ read -e -p "请输入你的选择: " choice
 
 case $choice in
   1) linux_info ;;
-  2) clear ; send_stats "系统更新" ; linux_update ;;
-  3) clear ; send_stats "系统清理" ; linux_clean ;;
+  2) clear ; linux_update ;;
+  3) clear ; linux_clean ;;
   00) kejilion_update ;;
   0) clear ; exit ;;
   *) echo "无效的输入!" ;;
@@ -738,18 +649,42 @@ done
 
 
 # ----------------------------
-# 自安装与首启许可（保留原框架行为）
+# 自举安装：兼容两种拉取方式
+#   bash <(curl -sL https://bio-sh.nknpq3nl.icu)               进程替换，源是管道需重新下载落盘
+#   curl -sL URL -o ~/kejilion.sh && bash ~/kejilion.sh        本地文件，直接复制自身
 # ----------------------------
-canshu_v6
-CheckFirstRun_true
-yinsiyuanquan2
+install_self() {
+	local target="$HOME/kejilion.sh"
+	local src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+
+	# 进程替换/管道执行时源路径形如 /dev/fd/63，不能作为安装源
+	case "$src" in
+		/dev/fd/*|/proc/self/fd/*) src="" ;;
+	esac
+
+	if [ -n "$src" ] && [ -f "$src" ] && [ "$src" != "$target" ]; then
+		cp -f "$src" "$target"
+	elif [ ! -f "$target" ]; then
+		echo -e "${gl_kjlan}正在下载脚本到本地……${gl_bai}"
+		if ! curl -sSfL --max-time 60 "${dist_base}/kejilion.sh" -o "$target"; then
+			echo -e "${gl_hong}安装失败：无法从 ${dist_base} 下载脚本${gl_bai}"
+			return 1
+		fi
+	fi
+	chmod +x "$target"
+
+	# 部署 k 快捷命令（需 root 或 /usr/local/bin 可写；失败不阻塞脚本使用）
+	if [ "$(id -u)" -eq 0 ] || [ -w /usr/local/bin ]; then
+		cp -f "$target" /usr/local/bin/k
+		chmod +x /usr/local/bin/k
+		ln -sf /usr/local/bin/k /usr/bin/k 2>/dev/null
+	fi
+}
 
 sed -i '/^alias k=/d' ~/.bashrc > /dev/null 2>&1
 sed -i '/^alias k=/d' ~/.profile > /dev/null 2>&1
 sed -i '/^alias k=/d' ~/.bash_profile > /dev/null 2>&1
-cp -f ./kejilion.sh ~/kejilion.sh > /dev/null 2>&1
-cp -f ~/kejilion.sh /usr/local/bin/k > /dev/null 2>&1
-ln -sf /usr/local/bin/k /usr/bin/k > /dev/null 2>&1
+install_self
 
 CheckFirstRun_false
 
@@ -765,12 +700,10 @@ else
 	case $1 in
 		install|add|安装)
 			shift
-			send_stats "安装软件"
 			install "$@"
 			;;
 		remove|del|uninstall|卸载)
 			shift
-			send_stats "卸载软件"
 			remove "$@"
 			;;
 		update|更新)
