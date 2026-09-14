@@ -1,8 +1,8 @@
 #!/bin/bash
 # 生物信息学脚本工具箱 - 学校精简版
-# 基于 kejilion/sh v4.5.7 裁剪，仅保留：1.系统信息查询 2.系统更新 3.系统清理 00.脚本更新 0.退出
+# 基于 kejilion/sh v4.5.7 裁剪，保留：1.系统信息查询 2.系统更新 3.系统清理 4.生物信息环境搭建 00.脚本更新 0.退出
 # 项目仓库: https://github.com/randomNaming/bio-project-sh
-sh_v="1.0.0"
+sh_v="1.1.0"
 
 # 脚本分发地址（服务器 nginx 站点根，更新检查/下载均走此地址）
 dist_base="https://bio-sh.nknpq3nl.icu"
@@ -512,6 +512,645 @@ linux_clean() {
 
 
 # ----------------------------
+# 4. 生物信息环境搭建（PspC 推荐安装清单）
+# 目标系统 Ubuntu 24.04 LTS，清单：Python 3.10(Conda)、Biopython、SignalP 6.0h、
+# CD-HIT 4.8.1、MAFFT 7.526、IQ-TREE 3.1.3、R 4.4+、基础编译环境。
+# ConSurf 使用 Web Server，无需本地安装。
+# ----------------------------
+bio_env_name="bioinfo"
+bio_python_ver="3.10"
+bio_cdhit_ver="4.8.1"
+bio_mafft_ver="7.526"
+bio_iqtree_ver="3.1.3"
+bio_r_minver="4.4"
+bio_sigp_ver="6.0h"
+bio_dist_bio="${dist_base}/bio"
+bio_apt_updated="0"
+
+
+bio_init_paths() {
+	if [ "$(id -u)" -eq 0 ]; then
+		bio_conda_dir="/opt/miniconda3"
+		bio_work_dir="/opt/bioinfo-setup"
+	elif [ -d "$HOME/miniconda3" ] || [ ! -d "/opt/miniconda3" ]; then
+		bio_conda_dir="$HOME/miniconda3"
+		bio_work_dir="$HOME/.bioinfo-setup"
+	else
+		# 管理员已把 Miniconda 装在 /opt，普通用户直接复用
+		bio_conda_dir="/opt/miniconda3"
+		bio_work_dir="$HOME/.bioinfo-setup"
+	fi
+	bio_env_bin="$bio_conda_dir/envs/$bio_env_name/bin"
+	mkdir -p "$bio_work_dir"
+}
+
+
+bio_sudo() {
+	if [ "$(id -u)" -eq 0 ]; then
+		"$@"
+	elif command -v sudo >/dev/null 2>&1; then
+		sudo "$@"
+	else
+		"$@"
+	fi
+}
+
+
+bio_apt_ready() {
+	[ "$bio_apt_updated" = "1" ] && return 0
+	if command -v apt >/dev/null 2>&1; then
+		if [ "$(id -u)" -eq 0 ]; then
+			fix_dpkg >/dev/null 2>&1
+			env DEBIAN_FRONTEND=noninteractive apt update -y
+		elif command -v sudo >/dev/null 2>&1; then
+			sudo env DEBIAN_FRONTEND=noninteractive apt update -y
+		else
+			env DEBIAN_FRONTEND=noninteractive apt update -y
+		fi
+		bio_apt_updated="1"
+	fi
+}
+
+
+bio_apt_install() {
+	bio_apt_ready
+	bio_sudo env DEBIAN_FRONTEND=noninteractive apt install -y "$@"
+}
+
+
+bio_fetch() {
+	# bio_fetch <保存路径> <URL> [备用URL]
+	local out="$1" url="$2" mirror="$3"
+	mkdir -p "$(dirname "$out")"
+	if curl -sSfL --retry 2 --connect-timeout 15 --max-time 1800 -o "$out" "$url"; then
+		return 0
+	fi
+	if [ -n "$mirror" ]; then
+		echo -e "${gl_huang}官方源下载失败，尝试备用源……${gl_bai}"
+		curl -sSfL --retry 2 --connect-timeout 15 --max-time 1800 -o "$out" "$mirror"
+	else
+		return 1
+	fi
+}
+
+
+bio_ver_ge() {
+	# bio_ver_ge <当前版本> <最低版本>，基于 sort -V 比较
+	[ "$(printf '%s\n%s\n' "${1:-0}" "$2" | sort -V | head -n 1)" = "$2" ]
+}
+
+
+bio_register_path() {
+	# 把指定 bin 目录写入登录配置，保证可执行程序加入 PATH
+	local bin_dir="$1"
+	local line="export PATH=\"$bin_dir:\$PATH\""
+	if [ "$(id -u)" -eq 0 ] && [ -d /etc/profile.d ]; then
+		echo "$line" > /etc/profile.d/bioinfo.sh
+	fi
+	if ! grep -qF '# bioinfo-env' ~/.bashrc 2>/dev/null; then
+		{ echo ""; echo "$line # bioinfo-env"; } >> ~/.bashrc
+	fi
+}
+
+
+bio_require_env() {
+	if [ ! -x "$bio_env_bin/python" ]; then
+		echo -e "${gl_huang}未检测到 $bio_env_name Python 环境，先自动安装 Miniconda + Python $bio_python_ver ……${gl_bai}"
+		bio_install_conda || return 1
+	fi
+	bio_register_path "$bio_env_bin"
+	export PATH="$bio_env_bin:$PATH"
+}
+
+
+bio_pip_install() {
+	# 优先官方 PyPI，失败自动切换清华 TUNA 镜像
+	if "$bio_env_bin/pip" install "$@"; then
+		return 0
+	fi
+	echo -e "${gl_huang}PyPI 官方源安装失败，切换清华 TUNA 镜像重试……${gl_bai}"
+	"$bio_env_bin/pip" install -i https://pypi.tuna.tsinghua.edu.cn/simple "$@"
+}
+
+
+bio_install_conda() {
+	local arch installer_url mirror_url tmp_sh
+	case "$(uname -m)" in
+		x86_64) arch="x86_64" ;;
+		aarch64|arm64) arch="aarch64" ;;
+		*)
+			echo -e "${gl_hong}不支持的 CPU 架构: $(uname -m)${gl_bai}"
+			return 1
+			;;
+	esac
+
+	if [ ! -x "$bio_conda_dir/bin/conda" ]; then
+		echo -e "${gl_kjlan}安装 Miniconda 到 $bio_conda_dir ……${gl_bai}"
+		installer_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$arch.sh"
+		mirror_url="https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-$arch.sh"
+		tmp_sh="$bio_work_dir/miniconda.sh"
+		if ! bio_fetch "$tmp_sh" "$installer_url" "$mirror_url"; then
+			echo -e "${gl_hong}Miniconda 下载失败，请检查网络后重试${gl_bai}"
+			return 1
+		fi
+		if ! bash "$tmp_sh" -b -p "$bio_conda_dir"; then
+			echo -e "${gl_hong}Miniconda 安装失败（目录不可写？）${gl_bai}"
+			return 1
+		fi
+		rm -f "$tmp_sh"
+	else
+		echo -e "${gl_lv}Miniconda 已存在：$bio_conda_dir${gl_bai}"
+	fi
+
+	if [ -x "$bio_env_bin/python" ] && "$bio_env_bin/python" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else 1)' 2>/dev/null; then
+		echo -e "${gl_lv}Python $bio_python_ver 环境已就绪：$bio_env_bin${gl_bai}"
+	else
+		if [ -d "$bio_conda_dir/envs/$bio_env_name" ]; then
+			echo -e "${gl_huang}检测到旧的 $bio_env_name 环境（不完整或 Python 版本不符），正在重建……${gl_bai}"
+			"$bio_conda_dir/bin/conda" env remove -y -n "$bio_env_name" >/dev/null 2>&1
+			rm -rf "$bio_conda_dir/envs/$bio_env_name"
+		fi
+		echo -e "${gl_kjlan}创建 conda 虚拟环境 $bio_env_name（Python $bio_python_ver）……${gl_bai}"
+		if ! "$bio_conda_dir/bin/conda" create -y -n "$bio_env_name" "python=$bio_python_ver"; then
+			echo -e "${gl_huang}conda 官方源创建失败，写入清华 TUNA 镜像后重试……${gl_bai}"
+			cat > "$bio_conda_dir/.condarc" 2>/dev/null <<EOF
+channels:
+  - defaults
+show_channel_urls: true
+default_channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+EOF
+			if ! "$bio_conda_dir/bin/conda" create -y -n "$bio_env_name" "python=$bio_python_ver"; then
+				echo -e "${gl_hong}conda 环境创建失败，请检查磁盘空间与网络${gl_bai}"
+				return 1
+			fi
+		fi
+	fi
+
+	bio_register_path "$bio_env_bin"
+	export PATH="$bio_env_bin:$PATH"
+	echo -e "${gl_lv}Python 环境搭建完成：$("$bio_env_bin/python" --version 2>&1)（$bio_env_bin）${gl_bai}"
+	echo -e "重新登录后 PATH 自动生效，当前会话已可直接使用。"
+}
+
+
+bio_install_biopython() {
+	bio_require_env || return 1
+	if "$bio_env_bin/python" -c 'import Bio' >/dev/null 2>&1; then
+		echo -e "${gl_lv}Biopython 已安装：v$("$bio_env_bin/python" -c 'import Bio; print(Bio.__version__)' 2>/dev/null)${gl_bai}"
+		return 0
+	fi
+	echo -e "${gl_kjlan}安装 Biopython ……${gl_bai}"
+	if ! bio_pip_install biopython; then
+		echo -e "${gl_hong}Biopython 安装失败${gl_bai}"
+		return 1
+	fi
+	echo -e "${gl_lv}Biopython 安装完成：v$("$bio_env_bin/python" -c 'import Bio; print(Bio.__version__)' 2>/dev/null)${gl_bai}"
+}
+
+
+bio_install_signalp() {
+	bio_require_env || return 1
+
+	# 已安装且模型权重齐全则跳过
+	local sigp_dir
+	sigp_dir=$("$bio_env_bin/python" -c 'import signalp, os; print(os.path.dirname(signalp.__file__))' 2>/dev/null)
+	if [ -x "$bio_env_bin/signalp" ] && [ -n "$sigp_dir" ] && [ -n "$(ls -A "$sigp_dir/model_weights" 2>/dev/null)" ]; then
+		echo -e "${gl_lv}SignalP 已安装：$("$bio_env_bin/signalp" --version 2>&1 | head -n 1)${gl_bai}"
+		return 0
+	fi
+
+	echo -e "${gl_huang}SignalP $bio_sigp_ver 由丹麦技术大学（DTU）发布，仅限学术研究使用。${gl_bai}"
+	echo -e "继续安装即表示你已确认符合 DTU 学术使用许可。"
+	read -e -p "是否继续？(y/n): " bio_yn
+	case "$bio_yn" in
+		y|Y) ;;
+		*)
+			echo "已取消，可稍后在菜单中单独重试。"
+			return 1
+			;;
+	esac
+
+	local tarball="$bio_work_dir/signalp-$bio_sigp_ver.tar.gz"
+	local models_tar="$bio_work_dir/signalp-$bio_sigp_ver.models.tar.gz"
+
+	# DTU 官网需人工申请下载，包体由校内分发服务器或用户手动放置提供
+	if [ ! -s "$tarball" ]; then
+		echo -e "${gl_kjlan}下载 SignalP $bio_sigp_ver 安装包（校内源）……${gl_bai}"
+		if ! bio_fetch "$tarball" "$bio_dist_bio/signalp-$bio_sigp_ver.tar.gz"; then
+			echo -e "${gl_hong}无法自动获取 SignalP 安装包。${gl_bai}"
+			echo -e "请访问 ${gl_huang}https://services.healthtech.dtu.dk/services/SignalP-6.0/${gl_bai} Downloads 页签，"
+			echo -e "填写姓名/邮箱并同意学术许可后，下载以下两个文件并放到 ${gl_huang}$bio_work_dir/${gl_bai}（保持文件名不变）："
+			echo -e "  1. signalp-$bio_sigp_ver.tar.gz"
+			echo -e "  2. signalp-$bio_sigp_ver.models.tar.gz"
+			echo -e "放置后重新运行本项，脚本会自动完成剩余步骤。"
+			echo -e "管理员也可把两个包上传到 ${gl_huang}$bio_dist_bio/${gl_bai}，全校即可一键自动安装。"
+			return 1
+		fi
+	fi
+	if [ ! -s "$models_tar" ]; then
+		echo -e "${gl_kjlan}下载 SignalP 模型权重包（校内源）……${gl_bai}"
+		bio_fetch "$models_tar" "$bio_dist_bio/signalp-$bio_sigp_ver.models.tar.gz" || rm -f "$models_tar"
+		if [ ! -s "$models_tar" ]; then
+			echo -e "${gl_hong}模型权重包获取失败，请手动下载 signalp-$bio_sigp_ver.models.tar.gz 放到 ${gl_huang}$bio_work_dir/${gl_bai}"
+			return 1
+		fi
+	fi
+
+	echo -e "${gl_kjlan}安装依赖（numpy <2 + CPU 版 PyTorch，体积较大，请耐心等待）……${gl_bai}"
+	bio_pip_install "numpy<2" || return 1
+	if ! "$bio_env_bin/pip" install torch --index-url https://download.pytorch.org/whl/cpu 2>/dev/null; then
+		echo -e "${gl_huang}PyTorch CPU 专用源失败，改用 PyPI……${gl_bai}"
+		bio_pip_install torch || return 1
+	fi
+
+	echo -e "${gl_kjlan}安装 SignalP Python 包 ……${gl_bai}"
+	local pkg_dir="$bio_work_dir/signalp-6-package"
+	rm -rf "$pkg_dir"
+	tar -zxf "$tarball" -C "$bio_work_dir" || { echo -e "${gl_hong}SignalP 安装包解压失败${gl_bai}"; return 1; }
+	[ -d "$pkg_dir" ] || pkg_dir=$(find "$bio_work_dir" -maxdepth 1 -type d -name 'signalp*6*' ! -name '*models*' 2>/dev/null | head -n 1)
+	if [ -z "$pkg_dir" ] || [ ! -d "$pkg_dir" ]; then
+		echo -e "${gl_hong}未找到 SignalP 包目录，解压结果异常${gl_bai}"
+		return 1
+	fi
+
+	bio_pip_install "$pkg_dir/" || { echo -e "${gl_hong}SignalP pip 安装失败${gl_bai}"; return 1; }
+
+	echo -e "${gl_kjlan}放置模型权重文件……${gl_bai}"
+	sigp_dir=$("$bio_env_bin/python" -c 'import signalp, os; print(os.path.dirname(signalp.__file__))' 2>/dev/null)
+	if [ -z "$sigp_dir" ]; then
+		echo -e "${gl_hong}无法定位 signalp 包目录，请手动放置模型权重${gl_bai}"
+		return 1
+	fi
+	tar -zxf "$models_tar" -C "$bio_work_dir" || { echo -e "${gl_hong}模型权重解压失败${gl_bai}"; return 1; }
+	local models_src=""
+	[ -d "$pkg_dir/models" ] && models_src="$pkg_dir/models"
+	[ -z "$models_src" ] && [ -d "$bio_work_dir/models" ] && models_src="$bio_work_dir/models"
+	if [ -z "$models_src" ] || [ -z "$(ls -A "$models_src" 2>/dev/null)" ]; then
+		echo -e "${gl_hong}未在压缩包中找到模型权重目录${gl_bai}"
+		return 1
+	fi
+	mkdir -p "$sigp_dir/model_weights"
+	mv -f "$models_src"/* "$sigp_dir/model_weights/" || { echo -e "${gl_hong}模型权重移动失败${gl_bai}"; return 1; }
+
+	if "$bio_env_bin/signalp" --version >/dev/null 2>&1; then
+		echo -e "${gl_lv}SignalP 安装完成：$("$bio_env_bin/signalp" --version 2>&1 | head -n 1)${gl_bai}"
+	else
+		echo -e "${gl_hong}SignalP 安装后验证失败，请检查上方日志${gl_bai}"
+		return 1
+	fi
+}
+
+
+bio_install_cdhit() {
+	if command -v cd-hit >/dev/null 2>&1; then
+		local cur
+		cur=$(cd-hit -h 2>&1 | grep -oiE 'version [0-9.]+' | head -n 1 | grep -oE '[0-9]+\.[0-9.]+')
+		if bio_ver_ge "$cur" "$bio_cdhit_ver"; then
+			echo -e "${gl_lv}CD-HIT 已安装：v$cur${gl_bai}"
+			return 0
+		fi
+		echo -e "${gl_huang}CD-HIT 版本低于 $bio_cdhit_ver（当前 ${cur:-未知}），尝试升级……${gl_bai}"
+	fi
+	echo -e "${gl_kjlan}通过 apt 安装 CD-HIT $bio_cdhit_ver ……${gl_bai}"
+	bio_apt_install cd-hit || { echo -e "${gl_hong}CD-HIT 安装失败${gl_bai}"; return 1; }
+	local new_ver
+	new_ver=$(cd-hit -h 2>&1 | grep -oiE 'version [0-9.]+' | head -n 1 | grep -oE '[0-9]+\.[0-9.]+')
+	echo -e "${gl_lv}CD-HIT 安装完成：v${new_ver:-未知}${gl_bai}"
+}
+
+
+bio_install_mafft() {
+	if command -v mafft >/dev/null 2>&1; then
+		local cur
+		cur=$(mafft --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n 1)
+		if bio_ver_ge "$cur" "$bio_mafft_ver"; then
+			echo -e "${gl_lv}MAFFT 已安装：v$cur${gl_bai}"
+			return 0
+		fi
+		echo -e "${gl_huang}MAFFT 版本低于 $bio_mafft_ver（当前 ${cur:-未知}），尝试升级……${gl_bai}"
+	fi
+	echo -e "${gl_kjlan}通过 apt 安装 MAFFT ……${gl_bai}"
+	bio_apt_install mafft || { echo -e "${gl_hong}MAFFT 安装失败${gl_bai}"; return 1; }
+	local new_ver
+	new_ver=$(mafft --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n 1)
+	if bio_ver_ge "$new_ver" "$bio_mafft_ver"; then
+		echo -e "${gl_lv}MAFFT 安装完成：v$new_ver${gl_bai}"
+		return 0
+	fi
+	# apt 源版本不足时回退 MAFFT 官方 deb（仅提供 x86_64）
+	if [ "$(uname -m)" != "x86_64" ]; then
+		echo -e "${gl_huang}系统源 MAFFT 版本为 ${new_ver:-未知}，官方 deb 仅支持 x86_64，请手动确认${gl_bai}"
+		return 1
+	fi
+	echo -e "${gl_kjlan}改用 MAFFT 官方 $bio_mafft_ver deb 包安装……${gl_bai}"
+	local deb="$bio_work_dir/mafft_${bio_mafft_ver}-1_amd64.deb"
+	if ! bio_fetch "$deb" "https://mafft.cbrc.jp/alignment/software/mafft_${bio_mafft_ver}-1_amd64.deb"; then
+		echo -e "${gl_hong}MAFFT 官方包下载失败${gl_bai}"
+		return 1
+	fi
+	bio_apt_install "$deb" || { echo -e "${gl_hong}MAFFT deb 安装失败${gl_bai}"; return 1; }
+	echo -e "${gl_lv}MAFFT 安装完成：$(mafft --version 2>&1 | head -n 1)${gl_bai}"
+}
+
+
+bio_install_iqtree() {
+	if command -v iqtree3 >/dev/null 2>&1; then
+		local cur
+		cur=$(iqtree3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+		if [ "$cur" = "$bio_iqtree_ver" ]; then
+			echo -e "${gl_lv}IQ-TREE 已安装：v$cur${gl_bai}"
+			return 0
+		fi
+	fi
+	local arch asset url
+	case "$(uname -m)" in
+		x86_64) arch="intel" ;;
+		aarch64|arm64) arch="arm64" ;;
+		*)
+			echo -e "${gl_hong}不支持的 CPU 架构: $(uname -m)${gl_bai}"
+			return 1
+			;;
+	esac
+	asset="iqtree-$bio_iqtree_ver-Linux-$arch.tar.gz"
+	url="https://github.com/iqtree/iqtree/releases/download/v$bio_iqtree_ver/$asset"
+	echo -e "${gl_kjlan}下载 IQ-TREE $bio_iqtree_ver 官方二进制（$arch）……${gl_bai}"
+	local tarball="$bio_work_dir/$asset"
+	if ! bio_fetch "$tarball" "$url"; then
+		echo -e "${gl_hong}IQ-TREE 下载失败，请检查网络或手动下载后安装：${gl_bai}"
+		echo -e "  $url"
+		return 1
+	fi
+	rm -rf "$bio_work_dir/iqtree-$bio_iqtree_ver-Linux-$arch"
+	tar -zxf "$tarball" -C "$bio_work_dir" || { echo -e "${gl_hong}IQ-TREE 解压失败${gl_bai}"; return 1; }
+	local src_bin
+	src_bin=$(find "$bio_work_dir/iqtree-$bio_iqtree_ver-Linux-$arch" -type f -name 'iqtree3*' 2>/dev/null | grep -v static | head -n 1)
+	if [ -z "$src_bin" ]; then
+		echo -e "${gl_hong}未在压缩包中找到 IQ-TREE 可执行文件${gl_bai}"
+		return 1
+	fi
+
+	local dest_dir
+	if [ "$(id -u)" -eq 0 ] || [ -w /usr/local/bin ]; then
+		dest_dir="/usr/local/bin"
+	else
+		dest_dir="$HOME/.local/bin"
+		mkdir -p "$dest_dir"
+		case ":$PATH:" in
+			*":$dest_dir:"*) ;;
+			*)
+				bio_register_path "$dest_dir"
+				export PATH="$dest_dir:$PATH"
+				;;
+		esac
+	fi
+	bio_sudo cp -f "$src_bin" "$dest_dir/iqtree3" || { echo -e "${gl_hong}IQ-TREE 部署失败${gl_bai}"; return 1; }
+	bio_sudo chmod 755 "$dest_dir/iqtree3"
+	bio_sudo ln -sf "$dest_dir/iqtree3" "$dest_dir/iqtree" 2>/dev/null
+	hash -r
+	echo -e "${gl_lv}IQ-TREE 安装完成：$(iqtree3 --version 2>&1 | head -n 1)${gl_bai}"
+}
+
+
+bio_install_r() {
+	if command -v R >/dev/null 2>&1; then
+		local cur
+		cur=$(R --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+		if bio_ver_ge "$cur" "$bio_r_minver"; then
+			echo -e "${gl_lv}R 已安装：v$cur${gl_bai}"
+			return 0
+		fi
+		echo -e "${gl_huang}R 版本低于 $bio_r_minver（当前 ${cur:-未知}），尝试升级……${gl_bai}"
+	fi
+
+	if ! command -v apt >/dev/null 2>&1; then
+		# 非 apt 发行版走通用安装
+		if command -v dnf >/dev/null 2>&1; then
+			bio_sudo dnf install -y R && echo -e "${gl_lv}R 安装完成：$(R --version 2>&1 | head -n 1)${gl_bai}" && return 0
+		elif command -v yum >/dev/null 2>&1; then
+			bio_sudo yum install -y R && echo -e "${gl_lv}R 安装完成：$(R --version 2>&1 | head -n 1)${gl_bai}" && return 0
+		fi
+		echo -e "${gl_hong}无法识别包管理器，请手动安装 R${gl_bai}"
+		return 1
+	fi
+
+	# Ubuntu/Debian：系统源自带版本偏旧，先走 CRAN 官方源拿 4.4+
+	local codename
+	codename=$(grep -E '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2)
+	if [ -n "$codename" ]; then
+		echo -e "${gl_kjlan}添加 CRAN 官方 apt 源（$codename-cran40）安装 R $bio_r_minver+ ……${gl_bai}"
+		bio_apt_install curl ca-certificates gpg >/dev/null 2>&1
+		bio_sudo mkdir -p /etc/apt/keyrings
+		if curl -fsSL --connect-timeout 15 --max-time 60 "https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc" | bio_sudo tee /etc/apt/keyrings/cran40.asc >/dev/null &&
+			echo "deb [signed-by=/etc/apt/keyrings/cran40.asc] https://cloud.r-project.org/bin/linux/ubuntu ${codename}-cran40/" | bio_sudo tee /etc/apt/sources.list.d/cran40.list >/dev/null; then
+			bio_apt_updated="0"
+			bio_apt_ready
+			if bio_apt_install r-base; then
+				local rv
+				rv=$(R --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+				echo -e "${gl_lv}R 安装完成：v${rv:-未知}${gl_bai}"
+				return 0
+			fi
+		fi
+		echo -e "${gl_huang}CRAN 源配置失败，回退系统 apt 源安装……${gl_bai}"
+	fi
+
+	if bio_apt_install r-base; then
+		local rv2
+		rv2=$(R --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+		if bio_ver_ge "$rv2" "$bio_r_minver"; then
+			echo -e "${gl_lv}R 安装完成：v$rv2${gl_bai}"
+		else
+			echo -e "${gl_huang}R 已安装但版本 v${rv2:-未知} 低于建议的 $bio_r_minver.x，请按需手动升级${gl_bai}"
+		fi
+		return 0
+	fi
+	echo -e "${gl_hong}R 安装失败${gl_bai}"
+	return 1
+}
+
+
+bio_install_buildtools() {
+	echo -e "${gl_kjlan}安装基础编译环境及常用依赖……${gl_bai}"
+	if command -v apt >/dev/null 2>&1; then
+		bio_apt_install build-essential gcc g++ make wget curl git unzip bzip2 xz-utils ca-certificates file pkg-config perl || {
+			echo -e "${gl_hong}基础编译环境安装失败${gl_bai}"
+			return 1
+		}
+	elif command -v dnf >/dev/null 2>&1; then
+		bio_sudo dnf install -y gcc gcc-c++ make wget curl git unzip bzip2 xz-utils file perl
+	elif command -v yum >/dev/null 2>&1; then
+		bio_sudo yum install -y gcc gcc-c++ make wget curl git unzip bzip2 xz-utils file perl
+	else
+		echo -e "${gl_hong}暂不支持该发行版，请手动安装 gcc/make/wget/curl/git${gl_bai}"
+		return 1
+	fi
+	echo -e "${gl_lv}基础编译环境就绪：gcc $(gcc -dumpversion 2>/dev/null)、$(git --version 2>/dev/null)${gl_bai}"
+}
+
+
+bio_row() {
+	# bio_row <组件名> <0=已装/1=未装> <版本信息>
+	if [ "$2" = "0" ]; then
+		echo -e "  ${gl_lv}[已安装]${gl_bai} $1 ${gl_huang}$3${gl_bai}"
+	else
+		echo -e "  ${gl_hong}[未安装]${gl_bai} $1"
+	fi
+}
+
+
+bio_check_status() {
+	bio_init_paths
+	local cur
+	echo -e "${gl_kjlan}生物信息学分析环境体检（PspC 清单）${gl_bai}"
+	echo "----------------------------------------"
+
+	if [ -x "$bio_env_bin/python" ]; then
+		local path_state
+		case ":$PATH:" in
+			*":$bio_env_bin:"*) path_state="PATH 已生效" ;;
+			*) path_state="PATH 重新登录后生效" ;;
+		esac
+		bio_row "Miniconda + Python $bio_python_ver（$bio_env_name 环境）" 0 "$("$bio_env_bin/python" --version 2>&1)，$path_state"
+	else
+		bio_row "Miniconda + Python $bio_python_ver（$bio_env_name 环境）" 1
+	fi
+
+	if "$bio_env_bin/python" -c 'import Bio' >/dev/null 2>&1; then
+		bio_row "Biopython（FASTA 读取/序列处理）" 0 "v$("$bio_env_bin/python" -c 'import Bio; print(Bio.__version__)' 2>/dev/null)"
+	else
+		bio_row "Biopython（FASTA 读取/序列处理）" 1
+	fi
+
+	if [ -x "$bio_env_bin/signalp" ]; then
+		bio_row "SignalP $bio_sigp_ver（信号肽预测）" 0 "$("$bio_env_bin/signalp" --version 2>&1 | head -n 1)"
+	else
+		bio_row "SignalP $bio_sigp_ver（信号肽预测）" 1
+	fi
+
+	if command -v cd-hit >/dev/null 2>&1; then
+		cur=$(cd-hit -h 2>&1 | grep -oiE 'version [0-9.]+' | head -n 1 | grep -oE '[0-9]+\.[0-9.]+')
+		bio_row "CD-HIT（序列去冗余）" 0 "v${cur:-未知}"
+	else
+		bio_row "CD-HIT（序列去冗余）" 1
+	fi
+
+	if command -v mafft >/dev/null 2>&1; then
+		cur=$(mafft --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n 1)
+		bio_row "MAFFT（多序列比对）" 0 "v${cur:-未知}"
+	else
+		bio_row "MAFFT（多序列比对）" 1
+	fi
+
+	if command -v iqtree3 >/dev/null 2>&1; then
+		cur=$(iqtree3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+		bio_row "IQ-TREE（系统发育树）" 0 "v${cur:-未知}"
+	else
+		bio_row "IQ-TREE（系统发育树）" 1
+	fi
+
+	if command -v R >/dev/null 2>&1; then
+		cur=$(R --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+		bio_row "R（统计/绘图）" 0 "v${cur:-未知}"
+	else
+		bio_row "R（统计/绘图）" 1
+	fi
+
+	if command -v gcc >/dev/null 2>&1 && command -v make >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+		bio_row "基础编译环境（gcc/make/git/wget/curl 等）" 0 "gcc v$(gcc -dumpversion 2>/dev/null)"
+	else
+		bio_row "基础编译环境（gcc/make/git/wget/curl 等）" 1
+	fi
+
+	echo -e "  ${gl_kjlan}[免安装]${gl_bai} ConSurf（蛋白保守性分析）使用 Web Server: https://consurf.tau.ac.cn"
+	if [ ! -x "$bio_env_bin/signalp" ]; then
+		echo -e "  ${gl_huang}提示：SignalP 手动安装包请放置于 $bio_work_dir/${gl_bai}"
+	fi
+	echo "----------------------------------------"
+}
+
+
+bio_install_all() {
+	local fail=0
+	echo -e "${gl_kjlan}开始一键安装 PspC 生物信息学分析环境……${gl_bai}"
+	echo -e "预计 20-60 分钟（取决于网络）；SignalP 步骤需确认一次学术许可。"
+	echo -e "安装顺序：基础编译环境 → Python 环境 → Biopython → CD-HIT → MAFFT → IQ-TREE → R → SignalP"
+	echo "----------------------------------------"
+
+	bio_install_buildtools || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_conda || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_biopython || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_cdhit || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_mafft || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_iqtree || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_r || fail=$((fail+1))
+	echo "----------------------------------------"
+	bio_install_signalp || fail=$((fail+1))
+	echo "----------------------------------------"
+
+	if [ "$fail" = "0" ]; then
+		echo -e "${gl_lv}全部组件安装完成！${gl_bai}"
+	else
+		echo -e "${gl_huang}安装结束，其中 $fail 项失败，可从菜单单独重试。${gl_bai}"
+	fi
+	echo -e "${gl_kjlan}环境体检结果：${gl_bai}"
+	bio_check_status
+}
+
+
+bioinfo_menu() {
+	bio_init_paths
+	while true; do
+		clear
+		echo -e "${gl_kjlan}"
+		echo "========================================"
+		echo " 生物信息学分析环境搭建（PspC 清单）"
+		echo "========================================"
+		echo -e "目标系统: Ubuntu 24.04 LTS    环境目录: ${gl_huang}$bio_env_bin${gl_bai}"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}1.   ${gl_bai}一键安装全部环境（推荐首次使用）"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}2.   ${gl_bai}Miniconda + Python $bio_python_ver 基础环境"
+		echo -e "${gl_kjlan}3.   ${gl_bai}Biopython（FASTA 读取/序列处理）"
+		echo -e "${gl_kjlan}4.   ${gl_bai}SignalP $bio_sigp_ver（信号肽预测，需学术许可）"
+		echo -e "${gl_kjlan}5.   ${gl_bai}CD-HIT $bio_cdhit_ver（序列去冗余）"
+		echo -e "${gl_kjlan}6.   ${gl_bai}MAFFT $bio_mafft_ver（多序列比对）"
+		echo -e "${gl_kjlan}7.   ${gl_bai}IQ-TREE $bio_iqtree_ver（系统发育树）"
+		echo -e "${gl_kjlan}8.   ${gl_bai}R $bio_r_minver.x+（统计/绘图）"
+		echo -e "${gl_kjlan}9.   ${gl_bai}基础编译环境及常用依赖"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}10.  ${gl_bai}环境体检（查看安装状态与版本）"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		read -e -p "请输入你的选择: " choice
+		case $choice in
+			1) clear; bio_install_all ;;
+			2) clear; bio_install_conda ;;
+			3) clear; bio_install_biopython ;;
+			4) clear; bio_install_signalp ;;
+			5) clear; bio_install_cdhit ;;
+			6) clear; bio_install_mafft ;;
+			7) clear; bio_install_iqtree ;;
+			8) clear; bio_install_r ;;
+			9) clear; bio_install_buildtools ;;
+			10) clear; bio_check_status ;;
+			0) break ;;
+			*) echo "无效的输入!" ;;
+		esac
+		break_end
+	done
+}
+
+
+# ----------------------------
 # 00. 脚本更新
 # ----------------------------
 kejilion_update() {
@@ -628,6 +1267,7 @@ echo -e "${gl_kjlan}------------------------${gl_bai}"
 echo -e "${gl_kjlan}1.   ${gl_bai}系统信息查询"
 echo -e "${gl_kjlan}2.   ${gl_bai}系统更新"
 echo -e "${gl_kjlan}3.   ${gl_bai}系统清理"
+echo -e "${gl_kjlan}4.   ${gl_bai}生物信息环境搭建"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
 echo -e "${gl_kjlan}00.  ${gl_bai}脚本更新"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -639,6 +1279,7 @@ case $choice in
   1) linux_info ;;
   2) clear ; linux_update ;;
   3) clear ; linux_clean ;;
+  4) bioinfo_menu ;;
   00) kejilion_update ;;
   0) clear ; exit ;;
   *) echo "无效的输入!" ;;
@@ -714,6 +1355,9 @@ else
 			;;
 		info)
 			linux_info
+			;;
+		env|环境)
+			bioinfo_menu
 			;;
 		*)
 			echo "未知命令: $1"
