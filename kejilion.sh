@@ -1,8 +1,8 @@
 #!/bin/bash
+sh_v="1.1.0"
 # 生物信息学脚本工具箱 - 学校精简版
 # 基于 kejilion/sh v4.5.7 裁剪，保留：1.系统信息查询 2.系统更新 3.系统清理 4.生物信息环境搭建 00.脚本更新 0.退出
 # 项目仓库: https://github.com/randomNaming/bio-project-sh
-sh_v="1.1.0"
 
 # 脚本分发地址（服务器 nginx 站点根，更新检查/下载均走此地址）
 dist_base="https://bio-sh.nknpq3nl.icu"
