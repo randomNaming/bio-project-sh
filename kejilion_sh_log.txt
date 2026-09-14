@@ -3,7 +3,9 @@
 2026-9-14   v1.1.0
 1.新增"4. 生物信息环境搭建"菜单：按 PspC 推荐安装清单自动部署 Miniconda+Python3.10、Biopython、SignalP 6.0h、CD-HIT 4.8.1、MAFFT 7.526、IQ-TREE 3.1.3、R 4.4+ 与基础编译环境，支持一键安装和逐项安装。
 2.各组件幂等安装：自动检测已装版本，符合要求即跳过；安装完成后自动输出"环境体检"版本报告；可执行程序统一写入 PATH（/etc/profile.d/bioinfo.sh 或 ~/.bashrc）。
-3.SignalP 6.0h 因 DTU 学术许可无法直链下载：优先从校内源 dist_base/bio/ 获取，或手动放置安装包到工作目录后自动续装；官方源失败时自动切换清华 TUNA 镜像（Miniconda/conda/PyPI）。
+3.新增完整安装日志：所有安装输出同步落盘（root: /opt/bioinfo-setup/install.log，普通用户: ~/.bioinfo-setup/install.log），菜单"11. 查看安装日志"可直接排障。
+4.修复下载健壮性：IQ-TREE 官方仓库更正为 iqtree/iqtree3 并支持多候选包名；所有下载支持断点续传与多次重试，官方源失败自动切换清华 TUNA 镜像（Miniconda/conda/PyPI）。
+5.SignalP 6.0h 因 DTU 学术许可无法直链下载：优先从校内源 dist_base/bio/ 获取，或手动放置安装包到工作目录后自动续装。
 ------------------------
 2026-9-13   v1.0.0
 1.基于 kejilion/sh 精简，仅保留系统信息查询、系统更新、系统清理、脚本自更新四个功能。

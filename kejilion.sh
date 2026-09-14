@@ -541,6 +541,7 @@ bio_init_paths() {
 		bio_work_dir="$HOME/.bioinfo-setup"
 	fi
 	bio_env_bin="$bio_conda_dir/envs/$bio_env_name/bin"
+	bio_log_file="$bio_work_dir/install.log"
 	mkdir -p "$bio_work_dir"
 }
 
@@ -579,18 +580,60 @@ bio_apt_install() {
 
 
 bio_fetch() {
-	# bio_fetch <保存路径> <URL> [备用URL]
-	local out="$1" url="$2" mirror="$3"
+	# bio_fetch <保存路径> <URL> [备用URL]：断点续传 + 多次重试，应对下载中途断流
+	local out="$1" url="$2" mirror="$3" attempt
 	mkdir -p "$(dirname "$out")"
-	if curl -sSfL --retry 2 --connect-timeout 15 --max-time 1800 -o "$out" "$url"; then
-		return 0
-	fi
+	for attempt in 1 2 3; do
+		if [ "$attempt" -gt 1 ] && [ -s "$out" ]; then
+			curl -sSfL -C - --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 1800 -o "$out" "$url" && return 0
+		else
+			curl -sSfL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 1800 -o "$out" "$url" && return 0
+		fi
+		[ "$attempt" -lt 3 ] && sleep 2
+	done
 	if [ -n "$mirror" ]; then
 		echo -e "${gl_huang}官方源下载失败，尝试备用源……${gl_bai}"
-		curl -sSfL --retry 2 --connect-timeout 15 --max-time 1800 -o "$out" "$mirror"
-	else
-		return 1
+		for attempt in 1 2 3; do
+			if [ "$attempt" -gt 1 ] && [ -s "$out" ]; then
+				curl -sSfL -C - --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 1800 -o "$out" "$mirror" && return 0
+			else
+				curl -sSfL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 1800 -o "$out" "$mirror" && return 0
+			fi
+			[ "$attempt" -lt 3 ] && sleep 2
+		done
 	fi
+	return 1
+}
+
+
+bio_logged() {
+	# bio_logged <描述> <函数> [参数...]：屏幕同步显示的同时，把完整输出落盘到安装日志
+	local label="$1" rc=0 fifo tee_pid
+	shift
+	mkdir -p "$bio_work_dir" 2>/dev/null
+	# 日志超过 5MB 时只保留末尾 2000 行，防止无限膨胀
+	if [ -f "$bio_log_file" ] && [ "$(wc -c < "$bio_log_file" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+		tail -n 2000 "$bio_log_file" > "$bio_log_file.tmp" 2>/dev/null && mv -f "$bio_log_file.tmp" "$bio_log_file"
+	fi
+	{
+		echo ""
+		echo "===== $(date '+%Y-%m-%d %H:%M:%S') 开始: $label ====="
+	} >> "$bio_log_file" 2>/dev/null
+	# FIFO + tee：输出实时上屏，wait 保证函数返回前日志已完整落盘
+	fifo="$bio_work_dir/.logfifo.$$"
+	mkfifo "$fifo" 2>/dev/null || fifo=""
+	if [ -n "$fifo" ]; then
+		tee -a "$bio_log_file" < "$fifo" &
+		tee_pid=$!
+		"$@" > "$fifo" 2>&1 || rc=$?
+		wait "$tee_pid"
+		rm -f "$fifo"
+	else
+		# mkfifo 不可用时退化为仅落盘（无实时上屏）
+		"$@" >> "$bio_log_file" 2>&1 || rc=$?
+	fi
+	echo "===== $(date '+%Y-%m-%d %H:%M:%S') 结束: $label (退出码 $rc) =====" >> "$bio_log_file" 2>/dev/null
+	return $rc
 }
 
 
@@ -844,7 +887,7 @@ bio_install_mafft() {
 		echo -e "${gl_huang}系统源 MAFFT 版本为 ${new_ver:-未知}，官方 deb 仅支持 x86_64，请手动确认${gl_bai}"
 		return 1
 	fi
-	echo -e "${gl_kjlan}改用 MAFFT 官方 $bio_mafft_ver deb 包安装……${gl_bai}"
+	echo -e "${gl_kjlan}改用 MAFFT 官方 $bio_mafft_ver deb 包安装（系统源版本：${new_ver:-未知}）……${gl_bai}"
 	local deb="$bio_work_dir/mafft_${bio_mafft_ver}-1_amd64.deb"
 	if ! bio_fetch "$deb" "https://mafft.cbrc.jp/alignment/software/mafft_${bio_mafft_ver}-1_amd64.deb"; then
 		echo -e "${gl_hong}MAFFT 官方包下载失败${gl_bai}"
@@ -864,28 +907,42 @@ bio_install_iqtree() {
 			return 0
 		fi
 	fi
-	local arch asset url
+	local arch candidates c tarball url
 	case "$(uname -m)" in
 		x86_64) arch="intel" ;;
-		aarch64|arm64) arch="arm64" ;;
+		aarch64|arm64) arch="arm" ;;
 		*)
 			echo -e "${gl_hong}不支持的 CPU 架构: $(uname -m)${gl_bai}"
 			return 1
 			;;
 	esac
-	asset="iqtree-$bio_iqtree_ver-Linux-$arch.tar.gz"
-	url="https://github.com/iqtree/iqtree/releases/download/v$bio_iqtree_ver/$asset"
-	echo -e "${gl_kjlan}下载 IQ-TREE $bio_iqtree_ver 官方二进制（$arch）……${gl_bai}"
-	local tarball="$bio_work_dir/$asset"
-	if ! bio_fetch "$tarball" "$url"; then
+	# 官方仓库为 iqtree/iqtree3，资产名随版本变化，依次尝试候选包
+	if [ "$arch" = "intel" ]; then
+		candidates="iqtree-$bio_iqtree_ver-Linux-intel.tar.gz iqtree-$bio_iqtree_ver-Linux.tar.gz"
+	else
+		candidates="iqtree-$bio_iqtree_ver-Linux-arm.tar.gz iqtree-$bio_iqtree_ver-Linux.tar.gz"
+	fi
+	tarball=""
+	for c in $candidates; do
+		url="https://github.com/iqtree/iqtree3/releases/download/v$bio_iqtree_ver/$c"
+		echo -e "${gl_kjlan}下载 IQ-TREE $bio_iqtree_ver 官方二进制：$c ……${gl_bai}"
+		if bio_fetch "$bio_work_dir/$c" "$url"; then
+			tarball="$bio_work_dir/$c"
+			break
+		fi
+		rm -f "$bio_work_dir/$c"
+	done
+	if [ -z "$tarball" ]; then
 		echo -e "${gl_hong}IQ-TREE 下载失败，请检查网络或手动下载后安装：${gl_bai}"
-		echo -e "  $url"
+		echo -e "  https://github.com/iqtree/iqtree3/releases/tag/v$bio_iqtree_ver"
 		return 1
 	fi
-	rm -rf "$bio_work_dir/iqtree-$bio_iqtree_ver-Linux-$arch"
-	tar -zxf "$tarball" -C "$bio_work_dir" || { echo -e "${gl_hong}IQ-TREE 解压失败${gl_bai}"; return 1; }
+	local ext_dir="$bio_work_dir/iqtree-extract"
+	rm -rf "$ext_dir"
+	mkdir -p "$ext_dir"
+	tar -zxf "$tarball" -C "$ext_dir" || { echo -e "${gl_hong}IQ-TREE 解压失败${gl_bai}"; return 1; }
 	local src_bin
-	src_bin=$(find "$bio_work_dir/iqtree-$bio_iqtree_ver-Linux-$arch" -type f -name 'iqtree3*' 2>/dev/null | grep -v static | head -n 1)
+	src_bin=$(find "$ext_dir" -type f -name 'iqtree3*' ! -name '*static*' 2>/dev/null | head -n 1)
 	if [ -z "$src_bin" ]; then
 		echo -e "${gl_hong}未在压缩包中找到 IQ-TREE 可执行文件${gl_bai}"
 		return 1
@@ -1105,6 +1162,20 @@ bio_install_all() {
 }
 
 
+bio_view_log() {
+	if [ ! -f "$bio_log_file" ]; then
+		echo -e "${gl_huang}暂无安装日志（尚未执行过安装）：$bio_log_file${gl_bai}"
+		return 0
+	fi
+	echo -e "${gl_kjlan}安装日志尾部 100 行${gl_bai}"
+	echo -e "完整日志文件: ${gl_huang}$bio_log_file${gl_bai}"
+	echo "----------------------------------------"
+	tail -n 100 "$bio_log_file"
+	echo "----------------------------------------"
+	echo -e "查看完整日志: ${gl_huang}less -R $bio_log_file${gl_bai}"
+}
+
+
 bioinfo_menu() {
 	bio_init_paths
 	while true; do
@@ -1114,6 +1185,7 @@ bioinfo_menu() {
 		echo " 生物信息学分析环境搭建（PspC 清单）"
 		echo "========================================"
 		echo -e "目标系统: Ubuntu 24.04 LTS    环境目录: ${gl_huang}$bio_env_bin${gl_bai}"
+		echo -e "安装日志: ${gl_huang}$bio_log_file${gl_bai}"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}1.   ${gl_bai}一键安装全部环境（推荐首次使用）"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -1127,21 +1199,23 @@ bioinfo_menu() {
 		echo -e "${gl_kjlan}9.   ${gl_bai}基础编译环境及常用依赖"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}10.  ${gl_bai}环境体检（查看安装状态与版本）"
+		echo -e "${gl_kjlan}11.  ${gl_bai}查看安装日志（排障）"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		read -e -p "请输入你的选择: " choice
 		case $choice in
-			1) clear; bio_install_all ;;
-			2) clear; bio_install_conda ;;
-			3) clear; bio_install_biopython ;;
-			4) clear; bio_install_signalp ;;
-			5) clear; bio_install_cdhit ;;
-			6) clear; bio_install_mafft ;;
-			7) clear; bio_install_iqtree ;;
-			8) clear; bio_install_r ;;
-			9) clear; bio_install_buildtools ;;
+			1) clear; bio_logged "一键安装全部环境" bio_install_all ;;
+			2) clear; bio_logged "Miniconda + Python $bio_python_ver 环境" bio_install_conda ;;
+			3) clear; bio_logged "Biopython" bio_install_biopython ;;
+			4) clear; bio_logged "SignalP $bio_sigp_ver" bio_install_signalp ;;
+			5) clear; bio_logged "CD-HIT $bio_cdhit_ver" bio_install_cdhit ;;
+			6) clear; bio_logged "MAFFT $bio_mafft_ver" bio_install_mafft ;;
+			7) clear; bio_logged "IQ-TREE $bio_iqtree_ver" bio_install_iqtree ;;
+			8) clear; bio_logged "R $bio_r_minver.x+" bio_install_r ;;
+			9) clear; bio_logged "基础编译环境及常用依赖" bio_install_buildtools ;;
 			10) clear; bio_check_status ;;
+			11) clear; bio_view_log ;;
 			0) break ;;
 			*) echo "无效的输入!" ;;
 		esac
